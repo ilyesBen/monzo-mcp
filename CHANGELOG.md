@@ -1,0 +1,194 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.11.0] - 2026-10-25
+
+First release of this fork of [partymola/monzo-mcp](https://github.com/partymola/monzo-mcp), taken at commit `76a42b2` (v0.10.0). Everything below 0.11.0 is upstream history.
+
+### Added
+
+- Business accounts. Monzo's `uk_business` type maps to a new `business` account type, so business accounts are synced by `monzo_sync` and selectable with `account_type="business"` in every tool that takes one. Rows cached from a business account by an earlier version still carry `personal` until a sync fetches them again.
+
+- Claude Desktop extension (`monzo.mcpb`), built by `scripts/build-mcpb.sh` and attached to each GitHub Release. Claude Desktop installs the Python dependencies itself with uv. Setup guide: `docs/claude-desktop.md`.
+- `monzo_login`, which runs the `monzo-mcp auth` flow in the background for clients with no terminal. It takes the client from `MONZO_CLIENT_ID` and `MONZO_CLIENT_SECRET` (the extension's settings) or from an earlier `auth`, and returns once the browser is open.
+- Every data tool declares `readOnlyHint`, and `tests/test_read_only.py` fails on any request other than a GET or the token endpoint's POST.
+
+### Fixed
+
+- Two MCP clients sharing one token file no longer log each other out. Monzo allows one live access token per client and each refresh token works once, so when one process refreshed, the other's next request failed with "Access token invalid". A 401 now re-reads the token file and retries once, and an expired token is taken from the file if another process has already refreshed it.
+
+### Changed
+
+- The "not configured" message also points to `monzo_login`.
+- `monzo_list_transactions` and `monzo_search_transactions` return only the payee's name in `counterparty`. Sort code and account number are still cached locally but are no longer sent to the model.
+- An installed package (pip, uvx, `git+https://...`) stores its credentials and cache in `$XDG_CONFIG_HOME/monzo-mcp/`, defaulting to `~/.config/monzo-mcp/`. Before, both resolved into the interpreter's lib directory, where a reinstall deleted them. A source checkout still keeps them beside the code.
+- The SQLite cache is created owner-only (mode 0600), like the credential files, and `auth` creates the config directory as 0700.
+
+### Removed
+
+- The Docker image, the MCP registry entry (`server.json`), the Glama listing and their publishing workflow. They were published under the upstream maintainer's name; this fork installs from source or straight from GitHub.
+
+## [0.10.0] - 2026-09-29
+
+### Fixed
+
+- A pending card payment is no longer deleted from the cache when another pending transaction matches it. The auth-hold cleanup after each sync was meant to remove a pending row only when its settled twin had arrived, but it removed any pending row with a match, so two pending rows at the same merchant for the same amount a few minutes apart deleted each other. A card payment retried seconds after a failed attempt looks exactly like that, and the payment that went through vanished from every tool. A routine sync fetches only from the newest cached transaction, so once a later one arrived the lost payment stayed lost. Two pending rows are now both kept. To restore one deleted by an earlier version, run `monzo_sync` with `since` set to a date before it. Within the last 90 days that works at any time; further back it needs the window just after approving access in the Monzo app, and a request refused outside it looks like an ordinary sync.
+- A declined card attempt is no longer counted as spending. The Monzo API lists declined attempts among the transactions, with the amount and merchant of the purchase that was refused, and sync stored them like any other row, so `monzo_spending`, `monzo_list_transactions` and `monzo_search_transactions` all reported money that was never spent. Declined attempts are now left out, and one already cached is removed when a sync fetches it again. A routine sync does not reach back that far, so to clear them run `monzo_sync` with `since` set to a date before the oldest, with the same 90-day limit as above.
+- A rewards account is no longer filed as the personal account. A Monzo login can include one, and it pays its balance out to the current account, so each payout was counted as spending in `monzo_spending` and matched by a credit on the current account; each sync also recorded the rewards balance as the personal balance. Rows already cached from a rewards account, open or closed, are removed on the next sync, and `monzo_list_accounts` shows it under Monzo's own type name.
+
+### Changed
+
+- Only current (`uk_retail`) and joint (`uk_retail_joint`) accounts are synced, the two types the Monzo API documents. Every other account type was previously synced as `personal`, which is how the rewards account above was counted. A business account, or any other type, is now listed by `monzo_list_accounts` under its own type name and reported by `monzo_sync` as skipped. Its transactions already in the cache are kept, since history older than about 11 months could not be fetched again, and they still count under `personal`.
+
+## [0.9.0] - 2026-08-31
+
+### Fixed
+
+- An invalid filter argument is refused instead of being answered with an empty result. `monzo_spending` given a `month` it could not parse reported `grand_total: 0`, and `monzo_list_transactions` and `monzo_search_transactions` given an unrecognised `account_type`, or a `since` or `before` that was not a date, reported no transactions. In each case the value reached the query as a filter that matched nothing, so the answer was indistinguishable from a real month with no spending or an account with no activity - which is the wrong answer to give about money, and worse than an error because nothing about it looks wrong. The tools now say what was rejected and what form was expected.
+- `monzo_spending` reads the month it was asked for. A single-digit month such as `2026-1` was used as a text prefix, so it matched October, November and December and reported their spending under January - with a total plausible enough not to invite a second look. Months are now zero-padded before the query.
+- `since` and `before` on the listing and search tools take a date, which is what those tools have always documented, and it is zero-padded before the query. `2026-1-1` was previously used as written, and because it sorts above every padded month `01` to `09` and below `10` to `12`, asking for transactions since 1 January returned only October onwards. Other spellings that cannot be ordered against stored transaction times are now refused rather than compared wrongly: `20260101` matched nothing at all, `2026-01-01 14:30` silently ignored the time of day, and a time-of-day bound could not be compared reliably at all, since stored times carry a fractional part whose width varies. `monzo_sync`'s `since` is unchanged and still takes a datetime, because it is sent to the Monzo API rather than compared against stored text.
+
+### Changed
+
+- `account_type` accepts only `personal` or `joint`, and the two values are declared in each tool's schema rather than checked inside it. A caller sending anything else now gets a validation error naming the accepted values, where `monzo_get_balance` and `monzo_list_pots` previously returned `{"error": ...}` and the other four accepted it silently. The check was a helper that had to be called at each site and was called at two of six; declaring it leaves nothing for a tool to forget.
+- `monzo_mcp.helpers.validate_account_type` and `VALID_ACCOUNT_TYPES` are gone, replaced by the `AccountType` annotation the schema is built from.
+- `monzo_mcp.errors` adds `InvalidDateError`. Like the other errors this package raises deliberately, its message reaches the model rather than being replaced by the tool name.
+
+## [0.8.0] - 2026-08-31
+
+### Security
+
+- `monzo-mcp auth` now checks the OAuth `state` on the callback, and generates one that cannot be guessed. The callback listener is an unauthenticated endpoint on localhost, so while `auth` was waiting any process on the machine could deliver its own authorisation code: that code was exchanged and the resulting tokens written to the token file, leaving the server reading someone else's Monzo account. A callback whose `state` does not match the request that started the flow is now refused before the code is read, so it is not exchanged either. The `state` itself was a UTC timestamp, guessable to the second, and is now 32 random bytes.
+
+### Changed
+
+- `mcp` 2.1.1, up from 2.0.0. That release keeps a `ToolError`'s text and replaces every other exception's with `Error executing tool <name>`, which on its own would have left a tool answering an expired token, an SCA prompt or a missing account with nothing but that line. The errors this package raises as its own types now travel as `ToolError`, so a caller still gets the text that says what to do. Anything unplanned keeps the new behaviour and stays in the server's log, which is where the absolute path in a failure to read the token file or the cache belongs.
+- `MonzoAuthError`, `MonzoSCAError`, `MonzoAPIError`, `TokenRefused` and `RefreshNetworkError` now share a `MonzoError` base, exported from the new `monzo_mcp.errors` alongside `AccountNotFound`. Each keeps the base it had, so `except ValueError` and `except RuntimeError` still catch what they caught.
+
+## [0.7.0] - 2026-08-21
+
+### Fixed
+
+- `monzo-mcp auth` reports a busy callback port instead of ending in a traceback, and binds it before opening the browser rather than after, so a run that cannot receive the callback does not send you to an authorisation page first.
+
+### Packaging
+
+- The package declares `Operating System :: OS Independent`, and CI runs the suite on Linux, macOS and Windows. It had only ever been tested on Linux while declaring nothing about platform support.
+
+### Security
+
+- On Windows, `monzo-mcp auth` no longer lets another process take over the port the authorisation code arrives on. The callback listener inherited `allow_reuse_address` from `http.server`, which on POSIX only waives the wait after a previous run. Windows reads it as consent to be displaced, so another process could bind over the live listener and receive the callback - and the code it carries is enough to obtain the tokens. The listener no longer asks to share the address, and asks for exclusive use as well. Both halves matter here: not asking is what closes it when the listener is bound to one interface, and exclusive use is what closes it when `MONZO_MCP_CALLBACK_HOST` widens the bind, as the container image does. The cost is Windows-only: after a run the port stays held until the previous connection has finished closing, normally a couple of minutes, and `auth` has to be retried until it has. Nothing changes on Linux or macOS.
+
+## [0.6.1] - 2026-08-09
+
+### Fixed
+
+- The container image keeps credentials and the transaction cache on a mountable volume. Both paths default to a location relative to the installed package, which inside the image is the interpreter's lib directory beside `site-packages` - not somewhere a user can mount, and gone when the container is replaced. A user running the published image got "not configured" from every tool, and anything they did authorise did not survive a restart. The image now sets `MONZO_MCP_CONFIG_DIR` and `MONZO_MCP_DB_PATH` under `/data` and declares it as a volume. Installs from source are unaffected: the defaults are unchanged, and only the image sets these variables.
+- `monzo-mcp auth` can complete inside a container. The callback server bound to `localhost`, which refuses connections arriving on the container's bridge interface - where a published port delivers them. Authorising in a container therefore waited for a callback that could never arrive, and waited indefinitely, so the one route to getting credentials onto the volume did not work. The interface is now `MONZO_MCP_CALLBACK_HOST`, still `localhost` everywhere except the image, which sets `0.0.0.0`. The redirect URI is unchanged.
+- The registry entry declares the volume the image needs, so a client configuring this server from the MCP registry is told to mount one rather than finding out from empty results.
+
+### Documentation
+
+- The README documents the container: where images are published, that tags carry a `v` prefix, that an OAuth client must be registered first, how to authorise into a named volume, and how to register the server against that same volume. It notes that no browser opens inside a container, that the callback port should be published on `127.0.0.1` rather than every interface, and that a bind mount leaves root-owned files unless `--user` is passed.
+- Running `auth` with nothing mounted at `/data` is called out. Because the image declares `/data` a volume, an unmounted run writes to an anonymous volume: with `--rm` it is discarded on exit, and without `--rm` a live refresh token is left behind in a volume nothing tracks.
+
+## [0.6.0] - 2026-08-09
+
+### Fixed
+
+- Installing this package no longer puts a module called `main` in the Python environment, where it could overwrite, or be overwritten by, any other package that does the same. Installed alongside another MCP server built the same way, whichever was installed second won, and the `monzo-mcp` command silently started the other server. The command name and everything a user types are unchanged.
+- On POSIX, credential files are created with owner-only permissions, and existing ones are tightened when rewritten on a best-effort basis - tightening needs ownership the writer may not have, and the file has already been emptied for rewriting by that point, so a permissions failure must not take the token with it. They were written with no mode set at all, so they took whatever the umask gave them - world-readable on a default umask, permanently, for a file holding a refresh token. Windows ignores the mode and governs access by inherited ACLs, so nothing changes there. A file created by an earlier version is narrowed the next time a token is saved; to check now, `ls -l config/`.
+- A data request that gets an unreadable answer is reported rather than escaping. A proxy or captive portal replying to an API call with HTML, with a body that will not decode, or with JSON that is not an object, raised past every handler in `api.get` and past the sync loop, which catches only the Monzo types. A read timeout or a truncated response did the same: `urlopen` wraps only connect-phase failures, so those arrive unwrapped. A sync that ends with a transaction error is now logged with status `error` rather than `ok`, whichever page of the history failed - a failure after the first page was not recorded at all, so a partial history was reported as a complete sync. Only a genuine SCA refusal produces the "approve in Monzo app" note; an unreadable response used to produce it too. An SCA refusal is still logged as a success, deliberately and on every page: it is answered by approving in the Monzo app, and nothing this client does before then changes the outcome. Reading and parsing are now separate steps.
+- Every sync that reaches the API now leaves a row in the sync log. The account lookup that opens a sync sits before the point where a token failure surfaces, and the log was opened after it, so the commonest failure of all left no trace; finding no accounts left none either. The log is opened first now. Recording is best-effort - a database that cannot be written to cannot take the row either - but a failure to record no longer replaces the error that caused it. A request rejected before any call is made, such as an unparseable `since` date, still writes nothing: no sync was attempted.
+- The comparison against the previous month applies the same filters as the month it is compared with. Asking for one category, or one account, compared that filtered month against every transaction in the month before it, and reported the difference as a percentage change - so a month with identical spending on the account asked about could be reported as ninety per cent down.
+- The once-a-day automatic sync compares two timestamps in the same timezone. The sync log records UTC and the comparison used the local date, so east of Greenwich there was a window each night in which a sync that had just finished counted as yesterday's, and every tool call started another one - the retry storm the throttle exists to prevent. "Today" now means the UTC day everywhere: west of Greenwich a sync late in the local evening counts towards the next day, so there can be one extra sync per local day.
+- A failure while reading a balance or a pot reports the kind of failure rather than repeating its message. Both were caught by a bare `except`, whose message set cannot be known in advance, and the result is returned to the model.
+- The automatic sync decides it has already run today by counting attempts rather than successes. It counted successes, so a sync that kept failing never advanced the timestamp gating it, and every tool call started a fresh full sync - answering a rate limit or a captive portal by retrying continuously, and writing a log row each time. The trade is deliberate and worth knowing: a failed sync now suppresses automatic syncing for the rest of the day even after the cause clears. `monzo_sync` forces one at any time.
+
+## [0.5.1] - 2026-08-09
+
+### Fixed
+
+- Every way of failing to obtain an access token is now classified, and reaches callers as one of two outcomes rather than escaping. Only a refusal is an authentication failure: HTTP 400 or 401, a response carrying no token, or credentials that are missing, unreadable or malformed. Everything else is a network error - an unreachable server, a read timeout, a reset connection, a truncated or non-HTTP response, a body that will not decode, a 403, a rate limit, and a 5xx.
+
+  The classification is made where the token is obtained, with a catch-all at that boundary, so an unanticipated failure is a network error by construction rather than by listing exception types. The distinction matters because an authentication failure tells the user to re-authorise, which rewrites the shared token file and spends the refresh token the syncing host owns - the wrong answer to a rate limit or a dropped connection, both of which clear on their own. 403 is treated as a network condition: it is what a WAF returns, and this client already reads 403 on a data request as a Strong Customer Authentication prompt.
+- The message reported when a token cannot be obtained is fixed text. It previously carried the underlying exception, which for a credential-file failure is an absolute path, into a string that reaches the MCP client.
+
+### Packaging
+
+- The container image is built on Python 3.14 instead of 3.13, and 3.14 joins the supported-version classifiers. `requires-python` is unchanged at `>=3.13`: the package still supports both, and only the published image moves. Installing from PyPI is unaffected - that uses whichever Python the user already has.
+- Dependency updates are automated. Every dependency, the base image and the CI actions are pinned to exact versions, so nothing changes without a deliberate bump; Dependabot now proposes those bumps rather than leaving the pins to rot.
+
+## [0.5.0] - 2026-08-03
+
+### Changed
+
+- Ported to the `mcp` 2.x server API. 2.0.0 renamed `mcp.server.fastmcp` to `mcp.server.mcpserver` and the `FastMCP` class to `MCPServer`, with no compatibility alias. The tool contract is unchanged: every tool keeps its name, description, and input and output schemas.
+- The `mcp<2` cap added in 0.4.0 is lifted, now that the server runs on 2.x. It was a holding action to keep installs working, not the destination.
+- Every dependency is pinned to an exact version instead of a lower bound: `mcp` 2.0.0, and for development `pytest` 9.1.1 and `ruff` 0.16.1.
+
+### Packaging
+
+- The build toolchain is pinned alongside the dependencies: `setuptools` to an exact version, the `python:3.13-slim` base image by digest, and every GitHub Action to a full commit SHA rather than a moving major tag. A floating tag can change what a build produces with nobody deciding, which is the same failure the dependency pins address.
+
+## [0.4.0] - 2026-08-02
+
+### Changed
+
+- **Breaking:** every account-scoped tool now names the account in its response, under one key. `monzo_list_pots`, `monzo_list_transactions` and `monzo_search_transactions` return `{"account_type": ..., "pots"/"transactions": [...]}` instead of a bare array; `monzo_spending` gains `account_type` on all four result shapes; and `monzo_sync`'s per-account details rename `account` to `account_type`. An empty array previously carried no trace of which account produced it, so "nothing there" and "wrong account" were indistinguishable - and the sync response was the one place calling this field `account` while every tool argument is `account_type`, which makes passing the wrong argument name easy. Where no account filter is given the value is `null`, keeping "all accounts" distinct from a missing key.
+
+### Fixed
+
+- `mcp` is now capped below 2.0. The dependency was declared `>=1.6.0` with no upper bound, so once `mcp` 2.0.0 was published a clean install pulled it in and the server failed to import - 2.0.0 no longer ships `mcp.server.fastmcp`, which this server is built on.
+
+## [0.3.0] - 2026-07-18
+
+### Added
+
+- Counterparty support for bank transfers (faster payments, p2p, Bacs): sync now persists the payee's name, sort code, account number, and user id from the `counterparty` object the transactions endpoint already returns. `monzo_list_transactions` and `monzo_search_transactions` include a `counterparty` object for transactions that have one, and search also matches the counterparty name - so transfers can be found by payee. Existing databases are migrated automatically (new nullable columns); previously cached rows gain counterparty data when re-fetched by a later sync.
+
+## [0.2.1] - 2026-07-11
+
+### Packaging
+
+- Listed in the official MCP registry (`io.github.partymola/monzo-mcp`) via a GHCR container image; a release workflow builds/pushes the image and publishes to the registry.
+
+## [0.2.0] - 2026-06-09
+
+### Added
+
+- `monzo_sync` (and the underlying `run_sync`) accept an optional `since` parameter - an ISO date (`2026-01-01`) or datetime (`2026-01-01T14:30:00Z`) - to backfill from an explicit start, overriding last-sync resumption. The value is coerced to RFC3339 and passed straight to the Monzo API; reaching beyond ~90 days only works inside the post-auth SCA window, otherwise the existing 90-day fallback applies.
+- `monzo-mcp --version` prints the installed package version.
+- Continuous integration now runs the test suite on Python 3.14 in addition to 3.13.
+
+## [0.1.0] - 2026-04-26
+
+### Added
+
+- Initial release.
+- OAuth 2.0 authentication against the Monzo Developer API with automatic token refresh.
+- Local SQLite cache for transactions, balance snapshots, and pot snapshots, with auto-sync on stale data.
+- Pagination, SCA fallback handling, and auth-hold dedup for transaction sync.
+- MCP tools (read-only): `monzo_list_accounts`, `monzo_get_balance`, `monzo_list_pots`, `monzo_sync`, `monzo_list_transactions`, `monzo_search_transactions`, `monzo_spending`.
+- Spending analysis with category breakdown, top merchants, and month-over-month comparison.
+- Transaction search across merchant name, description, and notes.
+- Pre-commit hook (`scripts/check-no-data.sh`) blocking commit of databases, tokens, and other secrets.
+
+[Unreleased]: https://github.com/partymola/monzo-mcp/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/partymola/monzo-mcp/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/partymola/monzo-mcp/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/partymola/monzo-mcp/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/partymola/monzo-mcp/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/partymola/monzo-mcp/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/partymola/monzo-mcp/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/partymola/monzo-mcp/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/partymola/monzo-mcp/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/partymola/monzo-mcp/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/partymola/monzo-mcp/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/partymola/monzo-mcp/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/partymola/monzo-mcp/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/partymola/monzo-mcp/releases/tag/v0.1.0

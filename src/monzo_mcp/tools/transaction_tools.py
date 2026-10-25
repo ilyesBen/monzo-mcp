@@ -1,0 +1,516 @@
+"""Transaction sync, listing, and search tools."""
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+import anyio
+
+from .. import api
+from ..api import MonzoAPIError, MonzoSCAError
+from ..db import get_db, get_last_sync_attempt, log_sync, save_balance
+from ..helpers import (
+    ACCOUNT_TYPES,
+    AccountType,
+    format_response,
+    parse_day,
+    pence_to_pounds,
+    require_auth,
+)
+from ..mcp_instance import READ_ONLY, mcp
+
+logger = logging.getLogger(__name__)
+
+
+def _format_transaction(row) -> dict:
+    """Format a DB row as a transaction dict with amounts in pounds."""
+    result = {
+        "id": row["id"],
+        "account_type": row["account_type"],
+        "date": row["created"][:10],
+        "created": row["created"],
+        "amount": pence_to_pounds(row["amount"]),
+        "currency": row["currency"],
+        "description": row["description"],
+        "merchant": row["merchant_name"],
+        "category": row["category"],
+        "notes": row["notes"] or None,
+        "settled": row["settled"] or None,
+    }
+    # Only the payee's name leaves the server. Sort code and account number
+    # stay in the local cache, so bank details never reach the model.
+    if row["counterparty_name"]:
+        result["counterparty"] = {"name": row["counterparty_name"]}
+    return result
+
+
+def _coerce_since(value: str) -> str:
+    """Coerce an ISO date or datetime to RFC3339 (``YYYY-MM-DDTHH:MM:SSZ``).
+
+    Accepts a bare date (``2026-01-01``) or a full ISO datetime
+    (``2026-01-01T14:30:00Z`` or ``...+00:00``). Naive values are treated as UTC.
+    Raises ``ValueError`` if the value cannot be parsed.
+    """
+    dt = datetime.fromisoformat(value.strip())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run_sync(account_type: str | None = None, since: str | None = None) -> dict:
+    """Sync transactions, balances, and pots from the Monzo API into the local cache.
+
+    Fetches up to 11 months of history (within SCA window) or falls back to
+    the last-synced timestamp / 90 days. Handles pagination and auth-hold
+    deduplication automatically. Declined card attempts are not stored.
+
+    Args:
+        account_type: "personal", "joint", "business", or None to sync all
+        since: Optional ISO date ("2026-01-01") or datetime ("2026-01-01T14:30:00Z")
+            to start the backfill from, overriding last-sync resumption. Reaching
+            beyond ~90 days only works inside the post-auth SCA window; outside it
+            the request is refused and sync falls back to the newest cached
+            transaction (the value is passed straight to the Monzo API, not gated
+            client-side).
+    """
+    since_override = None
+    if since is not None:
+        try:
+            since_override = _coerce_since(since)
+        except ValueError:
+            return {
+                "error": (
+                    f"Invalid 'since' value: {since!r}. "
+                    "Use an ISO date (2026-01-01) or datetime (2026-01-01T14:30:00Z)."
+                )
+            }
+
+    db = get_db()
+    try:
+        # Opened before the first API call, not after it: /accounts is where a
+        # token failure surfaces, and a row cannot be written on a connection
+        # that does not exist yet.
+        accounts_data = api.get("/accounts")
+        accounts = accounts_data.get("accounts", [])
+        if not accounts:
+            log_sync(db, "error", 0, "no accounts")
+            return {"error": "No Monzo accounts found"}
+
+        total_added = 0
+        accounts_synced = 0
+        sync_details = []
+
+        # A rewards account pays its balance out to the current account, so
+        # rows cached from it double-count as spending. Its own pass, because
+        # the sync loop skips closed accounts and a closed one needs this too.
+        for acct in accounts:
+            if acct.get("type") == "uk_rewards":
+                db.execute("DELETE FROM monzo_transactions WHERE account_id = ?", (acct["id"],))
+
+        for acct in accounts:
+            if acct.get("closed"):
+                continue
+            acct_id = acct["id"]
+            atype = ACCOUNT_TYPES.get(acct.get("type"))
+            if atype is None:
+                sync_details.append({"skipped_account_type": acct.get("type")})
+                continue
+
+            if account_type and atype != account_type:
+                continue
+
+            detail = {"account_type": atype}
+
+            try:
+                bal = api.get(f"/balance?account_id={acct_id}")
+                save_balance(
+                    db,
+                    atype,
+                    f"Monzo {atype.title()}",
+                    bal["balance"],
+                    bal.get("currency", "GBP"),
+                )
+                detail["balance"] = pence_to_pounds(bal["balance"])
+            except Exception as e:
+                # Type only, as the catch-all below. A bare except cannot know
+                # what its message set contains, and this reaches the model.
+                detail["balance_error"] = type(e).__name__
+
+            try:
+                pots_data = api.get(f"/pots?current_account_id={acct_id}")
+                pot_count = 0
+                for pot in pots_data.get("pots", []):
+                    if not pot.get("deleted"):
+                        save_balance(
+                            db,
+                            atype,
+                            pot["name"],
+                            pot["balance"],
+                            pot.get("currency", "GBP"),
+                        )
+                        pot_count += 1
+                detail["pots_synced"] = pot_count
+            except Exception as e:
+                detail["pots_error"] = type(e).__name__
+
+            since = since_override or (datetime.now(timezone.utc) - timedelta(days=335)).strftime(
+                "%Y-%m-%dT00:00:00Z"
+            )
+            added = 0
+            page = 0
+
+            while True:
+                try:
+                    txns = api.get(
+                        f"/transactions?account_id={acct_id}&since={since}&limit=100&expand[]=merchant"
+                    ).get("transactions", [])
+                except (MonzoSCAError, MonzoAPIError) as page_error:
+                    if page == 0:
+                        last_sync = db.execute(
+                            "SELECT MAX(created) FROM monzo_transactions WHERE account_id = ?",
+                            (acct_id,),
+                        ).fetchone()[0]
+                        fallback = last_sync or (
+                            datetime.now(timezone.utc) - timedelta(days=90)
+                        ).strftime("%Y-%m-%dT00:00:00Z")
+                        try:
+                            txns = api.get(
+                                f"/transactions?account_id={acct_id}&since={fallback}&limit=100&expand[]=merchant"
+                            ).get("transactions", [])
+                            if not last_sync:
+                                detail["sca_note"] = "SCA window expired, fetched last 90 days only"
+                        except MonzoSCAError:
+                            detail["sca_note"] = "SCA required - approve in Monzo app"
+                            break
+                        except MonzoAPIError as e:
+                            # Only an SCA refusal earns the SCA note. Telling
+                            # the user to approve something in the app is the
+                            # wrong answer to a dropped connection or an
+                            # unreadable response, and it hides the real cause.
+                            detail["transactions_error"] = str(e)
+                            break
+                    else:
+                        if isinstance(page_error, MonzoSCAError):
+                            detail["sca_note"] = "SCA required - approve in Monzo app"
+                        else:
+                            detail["transactions_error"] = str(page_error)
+                        break
+
+                if not txns:
+                    break
+
+                for tx in txns:
+                    if tx.get("decline_reason"):
+                        db.execute("DELETE FROM monzo_transactions WHERE id = ?", (tx["id"],))
+                        continue
+
+                    merchant_name = None
+                    if isinstance(tx.get("merchant"), dict):
+                        merchant_name = tx["merchant"].get("name")
+
+                    # Bank transfers (faster payments, p2p, bacs) carry the payee
+                    # in a counterparty object instead of a merchant
+                    counterparty = tx.get("counterparty")
+                    if not isinstance(counterparty, dict):
+                        counterparty = {}
+
+                    db.execute(
+                        """INSERT OR REPLACE INTO monzo_transactions
+                           (id, account_id, account_type, created, amount, currency,
+                            description, merchant_name, category, notes, settled,
+                            counterparty_name, counterparty_sort_code,
+                            counterparty_account_number, counterparty_user_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            tx["id"],
+                            acct_id,
+                            atype,
+                            tx["created"],
+                            tx["amount"],
+                            tx["currency"],
+                            tx.get("description", ""),
+                            merchant_name,
+                            tx.get("category", ""),
+                            tx.get("notes", ""),
+                            tx.get("settled", ""),
+                            counterparty.get("name"),
+                            counterparty.get("sort_code"),
+                            counterparty.get("account_number"),
+                            counterparty.get("user_id"),
+                        ),
+                    )
+                    added += 1
+
+                db.commit()
+                page += 1
+                since = txns[-1]["id"]
+
+                if len(txns) < 100:
+                    break
+
+            total_added += added
+            total_in_db = db.execute(
+                "SELECT COUNT(*) FROM monzo_transactions WHERE account_type = ?",
+                (atype,),
+            ).fetchone()[0]
+            detail["transactions_upserted"] = added
+            detail["total_in_db"] = total_in_db
+            accounts_synced += 1
+            sync_details.append(detail)
+
+        # Auth-hold deduplication
+        dupes = db.execute("""
+            DELETE FROM monzo_transactions WHERE id IN (
+                SELECT a.id
+                FROM monzo_transactions a
+                JOIN monzo_transactions b ON a.amount = b.amount
+                    AND a.merchant_name = b.merchant_name
+                    AND a.account_type = b.account_type
+                    AND a.id != b.id
+                    AND ABS(JULIANDAY(a.created) - JULIANDAY(b.created)) < 0.01
+                WHERE a.merchant_name IS NOT NULL
+                AND (a.settled = '' OR a.settled IS NULL)
+                AND b.settled != ''
+            )
+        """).rowcount
+        if dupes:
+            db.commit()
+
+        # An SCA refusal is deliberately not a failure: only the user
+        # approving in the Monzo app changes the outcome.
+        failed = [d for d in sync_details if d.get("transactions_error")]
+        status = "error" if failed else "ok"
+        log_sync(
+            db,
+            status,
+            total_added,
+            f"accounts={accounts_synced}, dupes_removed={dupes}",
+        )
+
+        return {
+            "accounts_synced": accounts_synced,
+            "transactions_upserted": total_added,
+            "duplicates_removed": dupes,
+            "details": sync_details,
+        }
+    except Exception as e:
+        # Type only: these paths carry API responses. Its own try, so a
+        # database that cannot take the row does not replace the exception
+        # that caused it.
+        try:
+            log_sync(db, "error", 0, f"unexpected {type(e).__name__}")
+        except Exception:
+            logger.error("Could not record a failed sync")
+        raise
+    finally:
+        db.close()
+
+
+def auto_sync_if_stale() -> None:
+    """Run an incremental sync if the cache has not been synced today.
+
+    Silently swallows all errors.
+    """
+    try:
+        conn = get_db()
+        try:
+            last_attempt = get_last_sync_attempt(conn)
+        finally:
+            conn.close()
+        # Both sides UTC. log_sync stores a UTC timestamp, so comparing it
+        # against a local date leaves a window each night where the row just
+        # written is dated behind today and the throttle never fires.
+        today = datetime.now(timezone.utc).date().isoformat()
+        if last_attempt is None or last_attempt[:10] < today:
+            run_sync()
+    except Exception:
+        pass
+
+
+@mcp.tool(annotations=READ_ONLY)
+@require_auth
+async def monzo_sync(account_type: AccountType | None = None, since: str | None = None) -> str:
+    """Sync transactions, balances, and pots from the Monzo API into the local cache.
+
+    Fetches up to 11 months of history (within SCA window) or falls back to
+    the last-synced timestamp / 90 days. Handles pagination and auth-hold
+    deduplication automatically. Declined card attempts are not stored. Only
+    current, joint and business accounts are synced; any other is listed as
+    skipped.
+
+    Args:
+        account_type: "personal", "joint", "business", or None to sync all
+        since: Optional ISO date ("2026-01-01") or datetime ("2026-01-01T14:30:00Z")
+            to start the backfill from, overriding last-sync resumption. Reaching
+            beyond ~90 days only works inside the post-auth SCA window.
+    """
+    result = await anyio.to_thread.run_sync(lambda: run_sync(account_type, since))
+    return format_response(result)
+
+
+@mcp.tool(annotations=READ_ONLY)
+@require_auth
+async def monzo_list_transactions(
+    account_type: AccountType | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    category: str | None = None,
+    merchant: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List transactions from the local cache.
+
+    Auto-syncs if the cache is stale (last sync before today).
+
+    Queries the synced transaction database, not the live API. Bank transfers
+    (faster payments, p2p, bacs) include a `counterparty` object with the payee
+    name. Bank details are kept in the local cache but not returned.
+
+    Returns `{"account_type": ..., "transactions": [...]}`, where account_type
+    echoes the filter applied and is null when unfiltered.
+
+    Args:
+        account_type: "personal", "joint" or "business" (default: all)
+        since: Start date, e.g. "2026-01-01" (inclusive)
+        before: End date, e.g. "2026-02-01" (exclusive)
+        category: Exact category match, e.g. "groceries", "eating_out", "transport"
+        merchant: Merchant name search (case-insensitive, partial match)
+        limit: Max results (default 50)
+    """
+    if since is not None:
+        since = parse_day(since, "since")
+    if before is not None:
+        before = parse_day(before, "before")
+
+    def _query():
+        auto_sync_if_stale()
+        db = get_db()
+        try:
+            count = db.execute("SELECT COUNT(*) FROM monzo_transactions").fetchone()[0]
+            if count == 0:
+                return format_response(
+                    {
+                        "error": (
+                            "No transaction data available. Check your Monzo auth "
+                            "with `monzo-mcp auth`."
+                        )
+                    }
+                )
+
+            conditions = []
+            params = []
+
+            if account_type:
+                conditions.append("account_type = ?")
+                params.append(account_type)
+            if since:
+                conditions.append("created >= ?")
+                params.append(since)
+            if before:
+                conditions.append("created < ?")
+                params.append(before)
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+            if merchant:
+                conditions.append("merchant_name LIKE ?")
+                params.append(f"%{merchant}%")
+
+            where = " AND ".join(conditions) if conditions else "1=1"
+            params.append(limit)
+
+            rows = db.execute(
+                f"SELECT * FROM monzo_transactions WHERE {where} ORDER BY created DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return format_response(
+                {
+                    "account_type": account_type,
+                    "transactions": [_format_transaction(r) for r in rows],
+                }
+            )
+        finally:
+            db.close()
+
+    return await anyio.to_thread.run_sync(_query)
+
+
+@mcp.tool(annotations=READ_ONLY)
+@require_auth
+async def monzo_search_transactions(
+    query: str,
+    account_type: AccountType | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    limit: int = 30,
+) -> str:
+    """Search cached transactions by merchant, counterparty (payee), description, or notes.
+
+    Auto-syncs if the cache is stale (last sync before today).
+
+    Case-insensitive partial match across merchant_name, counterparty_name,
+    description, and notes fields. Counterparty matching finds bank transfers
+    (faster payments, p2p, bacs) by payee name.
+
+    Returns `{"account_type": ..., "transactions": [...]}`, where account_type
+    echoes the filter applied and is null when unfiltered.
+
+    Args:
+        query: Search term
+        account_type: "personal", "joint" or "business" (default: all)
+        since: Start date, e.g. "2026-01-01" (inclusive)
+        before: End date, e.g. "2026-02-01" (exclusive)
+        limit: Max results (default 30)
+    """
+    if since is not None:
+        since = parse_day(since, "since")
+    if before is not None:
+        before = parse_day(before, "before")
+
+    def _query_db():
+        auto_sync_if_stale()
+        db = get_db()
+        try:
+            count = db.execute("SELECT COUNT(*) FROM monzo_transactions").fetchone()[0]
+            if count == 0:
+                return format_response(
+                    {
+                        "error": (
+                            "No transaction data available. Check your Monzo auth "
+                            "with `monzo-mcp auth`."
+                        )
+                    }
+                )
+
+            conditions = [
+                "(merchant_name LIKE ? OR counterparty_name LIKE ? "
+                "OR description LIKE ? OR notes LIKE ?)"
+            ]
+            params = [f"%{query}%"] * 4
+
+            if account_type:
+                conditions.append("account_type = ?")
+                params.append(account_type)
+            if since:
+                conditions.append("created >= ?")
+                params.append(since)
+            if before:
+                conditions.append("created < ?")
+                params.append(before)
+
+            where = " AND ".join(conditions)
+            params.append(limit)
+
+            rows = db.execute(
+                f"SELECT * FROM monzo_transactions WHERE {where} ORDER BY created DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return format_response(
+                {
+                    "account_type": account_type,
+                    "transactions": [_format_transaction(r) for r in rows],
+                }
+            )
+        finally:
+            db.close()
+
+    return await anyio.to_thread.run_sync(_query_db)

@@ -1,0 +1,1102 @@
+"""Tests for run_sync's paging, auth-hold dedup, SCA fallback, and filtering.
+
+Complements test_sync.py (which covers the `since` coercion). The Monzo HTTP
+client is mocked and the cache is in-memory SQLite, so no credentials or network
+are needed. Expected values are hand-derived from the fixtures.
+"""
+
+import json
+import pathlib
+import sqlite3
+import tempfile
+import unittest
+from datetime import date, datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlparse
+
+from monzo_mcp.api import MonzoAPIError, MonzoAuthError, MonzoSCAError
+from monzo_mcp.db import SCHEMA
+from monzo_mcp.tools import transaction_tools
+
+
+def _mk(txn_id, *, amount, created, settled, merchant="Acme Grocers", category="groceries"):
+    """Build a Monzo-API-shaped transaction dict."""
+    return {
+        "id": txn_id,
+        "created": created,
+        "amount": amount,
+        "currency": "GBP",
+        "description": merchant.upper(),
+        "merchant": {"name": merchant},
+        "category": category,
+        "notes": "",
+        "settled": settled,
+    }
+
+
+class _FakeApi:
+    """Configurable stand-in for monzo_mcp.api with call recording.
+
+    `txns_for(account_id, since, call_n)` returns a page of transactions or
+    raises; `balance` is returned for every /balance request.
+    """
+
+    def __init__(self, accounts, txns_for, balance=1000):
+        self.accounts = accounts
+        self.txns_for = txns_for
+        self.balance = balance
+        self.calls = []
+        self._txn_calls = 0
+
+    def get(self, path):
+        self.calls.append(path)
+        if path == "/accounts":
+            return {"accounts": self.accounts}
+        if path.startswith("/balance"):
+            return {"balance": self.balance, "currency": "GBP"}
+        if path.startswith("/pots"):
+            return {"pots": []}
+        if path.startswith("/transactions"):
+            q = parse_qs(urlparse(path).query)
+            self._txn_calls += 1
+            return {
+                "transactions": self.txns_for(
+                    q["account_id"][0], q.get("since", [None])[0], self._txn_calls
+                )
+            }
+        return {}
+
+    def txn_calls_for(self, account_id):
+        return [
+            p
+            for p in self.calls
+            if p.startswith("/transactions") and f"account_id={account_id}" in p
+        ]
+
+    def balance_calls_for(self, account_id):
+        return [
+            p for p in self.calls if p.startswith("/balance") and f"account_id={account_id}" in p
+        ]
+
+
+def _make_db():
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    return db
+
+
+def _run(fake, db, **kwargs):
+    with (
+        patch.object(transaction_tools.api, "get", fake.get),
+        patch.object(transaction_tools, "get_db", lambda: db),
+    ):
+        return transaction_tools.run_sync(**kwargs)
+
+
+class TestPaging(unittest.TestCase):
+    def test_full_page_triggers_a_second_fetch(self):
+        # Distinct merchants/amounts keep paging orthogonal to the auth-hold
+        # dedup pass, so the row counts below reflect paging alone.
+        page0 = [
+            _mk(
+                f"tx_{i:03d}",
+                amount=-100 * (i + 1),
+                created=f"2026-02-01T10:{i % 60:02d}:00Z",
+                settled="2026-02-01",
+                merchant=f"Shop {i:03d}",
+            )
+            for i in range(100)
+        ]
+        page1 = [
+            _mk(
+                "tx_100",
+                amount=-100,
+                created="2026-02-02T10:00:00Z",
+                settled="2026-02-02",
+                merchant="Shop 100",
+            )
+        ]
+
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return page0  # first page: exactly 100 -> loop continues
+            if since == "tx_099":
+                return page1  # cursor follow-up: 1 row (<100) -> loop stops
+            return []
+
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        result = _run(fake, _make_db())
+
+        # 100 + 1 rows upserted across exactly two /transactions fetches.
+        self.assertEqual(result["transactions_upserted"], 101)
+        self.assertEqual(len(fake.txn_calls_for("acc_1")), 2)
+        self.assertEqual(result["details"][0]["total_in_db"], 101)
+
+    def test_partial_first_page_stops_immediately(self):
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return [_mk("tx_a", amount=-100, created="2026-02-01T10:00:00Z", settled="")]
+            return []
+
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        result = _run(fake, _make_db())
+        self.assertEqual(result["transactions_upserted"], 1)
+        self.assertEqual(len(fake.txn_calls_for("acc_1")), 1)  # no needless follow-up
+
+
+class TestAuthHoldDedup(unittest.TestCase):
+    def _shared_named(self, name):
+        # Shared-cache in-memory DB: a holder connection keeps the data alive
+        # after run_sync closes its own connection, so we can inspect the rows.
+        # A distinct name per test avoids cross-test sharing of the cache.
+        uri = f"file:{name}?mode=memory&cache=shared"
+        holder = sqlite3.connect(uri, uri=True)
+        self.addCleanup(holder.close)
+        holder.row_factory = sqlite3.Row
+        holder.executescript(SCHEMA)
+
+        def get_db():
+            c = sqlite3.connect(uri, uri=True)
+            c.row_factory = sqlite3.Row
+            return c
+
+        return holder, get_db
+
+    def test_unsettled_hold_removed_settled_and_distinct_kept(self):
+        # dup_hold (unsettled) + dup_settled: same merchant/amount/account within
+        # ~5 min -> the unsettled hold is the auth-hold duplicate and is removed.
+        # both_a/both_b are both settled -> a genuine repeat pair, kept.
+        # solo has a distinct amount -> kept.
+        page = [
+            _mk("dup_hold", amount=-1500, created="2026-02-01T10:00:00Z", settled=""),
+            _mk("dup_settled", amount=-1500, created="2026-02-01T10:05:00Z", settled="2026-02-01"),
+            _mk(
+                "both_a",
+                amount=-2000,
+                created="2026-02-02T10:00:00Z",
+                settled="2026-02-02",
+                merchant="Beta Store",
+            ),
+            _mk(
+                "both_b",
+                amount=-2000,
+                created="2026-02-02T10:05:00Z",
+                settled="2026-02-02",
+                merchant="Beta Store",
+            ),
+            _mk("solo", amount=-999, created="2026-02-03T10:00:00Z", settled="2026-02-03"),
+        ]
+
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return page
+            return []
+
+        holder, get_db = self._shared_named("dedup_test")
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        with (
+            patch.object(transaction_tools.api, "get", fake.get),
+            patch.object(transaction_tools, "get_db", get_db),
+        ):
+            result = transaction_tools.run_sync()
+
+        self.assertEqual(result["transactions_upserted"], 5)  # counted before dedup
+        self.assertEqual(result["duplicates_removed"], 1)
+        remaining = {
+            r["id"] for r in holder.execute("SELECT id FROM monzo_transactions").fetchall()
+        }
+        self.assertEqual(remaining, {"dup_settled", "both_a", "both_b", "solo"})
+
+    def test_matching_pair_outside_time_window_is_kept(self):
+        # Same merchant/amount/account and one unsettled, but ~1 hour apart -
+        # outside the ~14 min auth-hold window - so it is a genuine repeat, not a
+        # hold, and must NOT be deduped. Pins the upper bound of the time window.
+        page = [
+            _mk("far_hold", amount=-1500, created="2026-02-01T10:00:00Z", settled=""),
+            _mk("far_settled", amount=-1500, created="2026-02-01T11:00:00Z", settled="2026-02-01"),
+        ]
+
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return page
+            return []
+
+        holder, get_db = self._shared_named("window_test")
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        with (
+            patch.object(transaction_tools.api, "get", fake.get),
+            patch.object(transaction_tools, "get_db", get_db),
+        ):
+            result = transaction_tools.run_sync()
+
+        self.assertEqual(result["duplicates_removed"], 0)
+        remaining = {
+            r["id"] for r in holder.execute("SELECT id FROM monzo_transactions").fetchall()
+        }
+        self.assertEqual(remaining, {"far_hold", "far_settled"})
+
+    def test_unsettled_rows_are_kept_without_a_settled_twin(self):
+        # Two genuine purchases at the same price minutes apart, neither settled
+        # yet: neither is a hold for the other. NULL settled counts as pending.
+        for settled in ("", None):
+            with self.subTest(settled=settled):
+                page = [
+                    _mk("first", amount=-1500, created="2026-02-01T10:00:00Z", settled=""),
+                    _mk("second", amount=-1500, created="2026-02-01T10:00:19Z", settled=settled),
+                ]
+
+                def txns_for(acct, since, n, page=page):
+                    if since is None or not since.startswith("tx_"):
+                        return page
+                    return []
+
+                holder, get_db = self._shared_named(f"both_unsettled_{settled!r}")
+                fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+                with (
+                    patch.object(transaction_tools.api, "get", fake.get),
+                    patch.object(transaction_tools, "get_db", get_db),
+                ):
+                    result = transaction_tools.run_sync()
+
+                self.assertEqual(result["duplicates_removed"], 0)
+                remaining = {
+                    r["id"] for r in holder.execute("SELECT id FROM monzo_transactions").fetchall()
+                }
+                self.assertEqual(remaining, {"first", "second"})
+
+
+class TestDeclinedAttemptsAreNotTransactions(unittest.TestCase):
+    """A declined attempt carries a real amount and merchant, so stored it counts as spending."""
+
+    def _sync(self, page, cached=(), txns_for=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+        for txn_id in cached:
+            db_conn.execute(
+                "INSERT INTO monzo_transactions (id, account_id, account_type, created, "
+                "amount, merchant_name, settled) VALUES (?, 'acc_1', 'personal', "
+                "'2026-02-01T10:00:00Z', -1500, 'Coffee Shop', '')",
+                (txn_id,),
+            )
+        db_conn.commit()
+
+        if txns_for is None:
+
+            def txns_for(acct, since, n):
+                if since is None or not since.startswith("tx_"):
+                    return page
+                return []
+
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        with (
+            patch.object(transaction_tools.api, "get", fake.get),
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+        ):
+            result = transaction_tools.run_sync()
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        ids = {r[0] for r in reopened.execute("SELECT id FROM monzo_transactions")}
+        return result, ids
+
+    def _declined(self, txn_id, created, reason="INSUFFICIENT_FUNDS"):
+        tx = _mk(txn_id, amount=-1500, created=created, settled="", merchant="Coffee Shop")
+        tx["decline_reason"] = reason
+        return tx
+
+    def test_a_declined_attempt_is_not_stored(self):
+        # The API emits reasons its docs do not list, so any reason counts.
+        for reason in ("INSUFFICIENT_FUNDS", "SCA_NOT_AUTHENTICATED_CARD_NOT_PRESENT", "OTHER"):
+            with self.subTest(reason=reason):
+                page = [
+                    self._declined("declined", "2026-02-01T10:00:00Z", reason),
+                    _mk("paid", amount=-800, created="2026-02-01T11:00:00Z", settled="2026-02-01"),
+                ]
+                result, ids = self._sync(page)
+                self.assertEqual(ids, {"paid"})
+                self.assertEqual(result["transactions_upserted"], 1)
+
+    def test_a_declined_attempt_already_cached_is_removed(self):
+        _, ids = self._sync(
+            [self._declined("declined", "2026-02-01T10:00:00Z")], cached=["declined", "other"]
+        )
+        self.assertEqual(ids, {"other"})
+
+    def test_a_retry_matching_a_declined_attempt_cached_earlier_is_kept(self):
+        # The cached attempt is not re-fetched, so it still reaches the dedup
+        # as an unsettled row matching the retry.
+        retry = _mk(
+            "retry",
+            amount=-1500,
+            created="2026-02-01T10:00:19Z",
+            settled="",
+            merchant="Coffee Shop",
+        )
+        _, ids = self._sync([retry], cached=["declined"])
+        self.assertIn("retry", ids)
+
+    def test_a_declined_last_row_does_not_end_paging(self):
+        # The cursor and the full-page test must see the page as the API sent it.
+        page0 = [
+            _mk(f"tx_{i:03d}", amount=-100, created="2026-02-01T10:00:00Z", settled="s")
+            for i in range(99)
+        ] + [self._declined("tx_099", "2026-02-01T11:00:00Z")]
+        page1 = [_mk("tx_100", amount=-100, created="2026-02-02T10:00:00Z", settled="s")]
+
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return page0
+            return page1 if since == "tx_099" else []
+
+        _, ids = self._sync(None, txns_for=txns_for)
+        self.assertIn("tx_100", ids)
+        self.assertNotIn("tx_099", ids)
+
+
+class TestCounterpartySync(unittest.TestCase):
+    def test_counterparty_persisted_for_transfers_and_null_for_cards(self):
+        transfer = _mk("tx_fp", amount=-39900, created="2026-02-01T10:00:00Z", settled="2026-02-01")
+        transfer["merchant"] = None
+        transfer["description"] = "Acme Solar LLP"
+        transfer["counterparty"] = {
+            "name": "Acme Solar LLP",
+            "sort_code": "123456",
+            "account_number": "12345678",
+            "user_id": "anonuser_ext1",
+        }
+        p2p = _mk("tx_p2p", amount=-2500, created="2026-02-01T11:00:00Z", settled="2026-02-01")
+        p2p["merchant"] = None
+        p2p["counterparty"] = {"name": "Jane Doe", "user_id": "user_friend1"}
+        card = _mk("tx_card", amount=-500, created="2026-02-02T10:00:00Z", settled="2026-02-02")
+
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return [transfer, p2p, card]
+            return []
+
+        uri = "file:counterparty_sync_test?mode=memory&cache=shared"
+        holder = sqlite3.connect(uri, uri=True)
+        self.addCleanup(holder.close)
+        holder.row_factory = sqlite3.Row
+        holder.executescript(SCHEMA)
+
+        def get_db():
+            c = sqlite3.connect(uri, uri=True)
+            c.row_factory = sqlite3.Row
+            return c
+
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        with (
+            patch.object(transaction_tools.api, "get", fake.get),
+            patch.object(transaction_tools, "get_db", get_db),
+        ):
+            result = transaction_tools.run_sync()
+
+        self.assertEqual(result["transactions_upserted"], 3)
+        rows = {r["id"]: r for r in holder.execute("SELECT * FROM monzo_transactions").fetchall()}
+        self.assertEqual(rows["tx_fp"]["counterparty_name"], "Acme Solar LLP")
+        self.assertEqual(rows["tx_fp"]["counterparty_sort_code"], "123456")
+        self.assertEqual(rows["tx_fp"]["counterparty_account_number"], "12345678")
+        self.assertEqual(rows["tx_fp"]["counterparty_user_id"], "anonuser_ext1")
+        # p2p payments carry only name + user_id
+        self.assertEqual(rows["tx_p2p"]["counterparty_name"], "Jane Doe")
+        self.assertIsNone(rows["tx_p2p"]["counterparty_sort_code"])
+        # Card transactions have no counterparty at all
+        self.assertIsNone(rows["tx_card"]["counterparty_name"])
+        self.assertIsNone(rows["tx_card"]["counterparty_user_id"])
+
+
+class TestScaFallback(unittest.TestCase):
+    def test_sca_on_first_fetch_falls_back_to_90_days(self):
+        # First /transactions raises SCA; on page 0 run_sync retries with a
+        # 90-day fallback window. With no prior rows, it records the sca_note.
+        def txns_for(acct, since, n):
+            if n == 1:
+                raise MonzoSCAError("SCA required")
+            if n == 2:
+                return [_mk("tx_fb", amount=-100, created="2026-02-01T10:00:00Z", settled="")]
+            return []
+
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        result = _run(fake, _make_db())
+
+        self.assertEqual(result["transactions_upserted"], 1)
+        self.assertEqual(
+            result["details"][0]["sca_note"], "SCA window expired, fetched last 90 days only"
+        )
+        self.assertEqual(len(fake.txn_calls_for("acc_1")), 2)  # initial + fallback
+
+    def test_sca_on_both_fetches_records_approval_note(self):
+        def txns_for(acct, since, n):
+            raise MonzoSCAError("SCA required")
+
+        fake = _FakeApi([{"id": "acc_1", "type": "uk_retail"}], txns_for)
+        result = _run(fake, _make_db())
+
+        self.assertEqual(result["transactions_upserted"], 0)
+        self.assertEqual(result["details"][0]["sca_note"], "SCA required - approve in Monzo app")
+
+
+class TestAccountSelection(unittest.TestCase):
+    def _txns_one_each(self):
+        def txns_for(acct, since, n):
+            if since is None or not since.startswith("tx_"):
+                return [_mk(f"tx_{acct}", amount=-100, created="2026-02-01T10:00:00Z", settled="")]
+            return []
+
+        return txns_for
+
+    def test_closed_account_is_skipped(self):
+        accounts = [
+            {"id": "acc_open", "type": "uk_retail"},
+            {"id": "acc_closed", "type": "uk_retail", "closed": True},
+        ]
+        fake = _FakeApi(accounts, self._txns_one_each())
+        result = _run(fake, _make_db())
+
+        self.assertEqual(result["accounts_synced"], 1)
+        # The closed account is never touched (no balance or transaction fetch).
+        self.assertEqual(fake.balance_calls_for("acc_closed"), [])
+        self.assertEqual(fake.txn_calls_for("acc_closed"), [])
+
+    def test_account_type_filter_syncs_only_matching_account(self):
+        accounts = [
+            {"id": "acc_personal", "type": "uk_retail"},
+            {"id": "acc_joint", "type": "uk_retail_joint"},
+        ]
+        fake = _FakeApi(accounts, self._txns_one_each())
+        result = _run(fake, _make_db(), account_type="joint")
+
+        self.assertEqual(result["accounts_synced"], 1)
+        self.assertEqual(result["details"][0]["account_type"], "joint")
+        # The personal account is filtered out before any transaction fetch.
+        self.assertEqual(fake.txn_calls_for("acc_personal"), [])
+        self.assertEqual(len(fake.txn_calls_for("acc_joint")), 1)
+
+    def test_no_accounts_returns_error(self):
+        fake = _FakeApi([], self._txns_one_each())
+        result = _run(fake, _make_db())
+        self.assertEqual(result["error"], "No Monzo accounts found")
+
+    def test_only_current_joint_and_business_accounts_are_synced(self):
+        # A rewards account pays its balance out to the current account, so
+        # its cached rows go, open or closed. Another type's cached history is
+        # kept: beyond the API's reach it could not be fetched again.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.executescript(SCHEMA)
+        for txn_id, account_id, account_type in (
+            ("cached_rewards", "acc_rewards", "personal"),
+            ("cached_closed_rewards", "acc_old_rewards", "personal"),
+            ("cached_business", "acc_business", "personal"),
+            ("cached_ok", "acc_p", "personal"),
+            ("cached_joint", "acc_j", "joint"),
+        ):
+            db_conn.execute(
+                "INSERT INTO monzo_transactions (id, account_id, account_type, created, amount) "
+                "VALUES (?, ?, ?, '2026-01-01T10:00:00Z', -100)",
+                (txn_id, account_id, account_type),
+            )
+        db_conn.commit()
+
+        accounts = [
+            {"id": "acc_p", "type": "uk_retail"},
+            {"id": "acc_rewards", "type": "uk_rewards"},
+            {"id": "acc_old_rewards", "type": "uk_rewards", "closed": True},
+            {"id": "acc_business", "type": "uk_business"},
+        ]
+        fake = _FakeApi(accounts, self._txns_one_each())
+        with (
+            patch.object(transaction_tools.api, "get", fake.get),
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+        ):
+            result = transaction_tools.run_sync()
+
+        self.assertEqual(result["accounts_synced"], 2)
+        self.assertIn({"skipped_account_type": "uk_rewards"}, result["details"])
+        self.assertNotIn({"skipped_account_type": "uk_business"}, result["details"])
+        self.assertEqual(fake.balance_calls_for("acc_rewards"), [])
+        self.assertEqual(fake.txn_calls_for("acc_rewards"), [])
+        self.assertNotEqual(fake.txn_calls_for("acc_business"), [])
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        ids = {r[0] for r in reopened.execute("SELECT id FROM monzo_transactions")}
+        self.assertEqual(
+            ids, {"cached_business", "cached_ok", "cached_joint", "tx_acc_p", "tx_acc_business"}
+        )
+
+    def test_each_account_resumes_from_its_own_newest_row(self):
+        # Outside the SCA window a sync resumes from the newest cached row.
+        # Rows kept from a skipped account still carry `personal`, so resuming
+        # per account type would skip what lies between.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.executescript(SCHEMA)
+        for txn_id, account_id, created in (
+            ("old_ok", "acc_p", "2026-01-01T10:00:00Z"),
+            ("new_business", "acc_business", "2026-03-01T10:00:00Z"),
+        ):
+            db_conn.execute(
+                "INSERT INTO monzo_transactions (id, account_id, account_type, created, amount) "
+                "VALUES (?, ?, 'personal', ?, -100)",
+                (txn_id, account_id, created),
+            )
+        db_conn.commit()
+
+        def txns_for(acct, since, n):
+            if n == 1:
+                raise MonzoSCAError("SCA required")
+            return []
+
+        accounts = [
+            {"id": "acc_p", "type": "uk_retail"},
+            {"id": "acc_business", "type": "uk_business"},
+        ]
+        fake = _FakeApi(accounts, txns_for)
+        with (
+            patch.object(transaction_tools.api, "get", fake.get),
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+        ):
+            transaction_tools.run_sync()
+
+        self.assertIn("since=2026-01-01T10:00:00Z", fake.txn_calls_for("acc_p")[-1])
+
+
+class TestAnUnreadableResponseIsNotAnSCAPrompt(unittest.TestCase):
+    """Only an SCA refusal earns the SCA note, and a failed sync is not "ok".
+
+    Telling the user to approve something in the Monzo app is the wrong
+    answer to a dropped connection, and logging the run as ok suppresses the
+    retry for the rest of the day.
+    """
+
+    def _run_with_transactions_failing(self, exc):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        def fake_get(path):
+            if path == "/accounts":
+                return {"accounts": [{"id": "acc_1", "type": "uk_retail", "closed": False}]}
+            if path.startswith("/balance") or path.startswith("/pots"):
+                return {"balance": 0, "currency": "GBP", "pots": []}
+            raise exc
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            result = transaction_tools.run_sync()
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        rows = reopened.execute("SELECT status FROM sync_log").fetchall()
+        return result, [r[0] for r in rows]
+
+    def test_an_api_error_is_not_reported_as_sca(self):
+        result, _ = self._run_with_transactions_failing(
+            MonzoAPIError("Monzo returned an unreadable response.")
+        )
+        detail = result["details"][0]
+        assert "sca_note" not in detail
+        assert "transactions_error" in detail
+
+    def test_an_sca_error_is_still_reported_as_sca(self):
+        result, _ = self._run_with_transactions_failing(MonzoSCAError("SCA"))
+        assert "SCA" in result["details"][0]["sca_note"]
+
+    def test_a_failed_sync_is_not_logged_as_ok(self):
+        _, statuses = self._run_with_transactions_failing(
+            MonzoAPIError("Monzo returned an unreadable response.")
+        )
+        assert statuses == ["error"]
+
+    def test_a_clean_sync_is_still_logged_as_ok(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        def fake_get(path):
+            if path == "/accounts":
+                return {"accounts": [{"id": "acc_1", "type": "uk_retail", "closed": False}]}
+            if path.startswith("/transactions"):
+                return {"transactions": []}
+            return {"balance": 0, "currency": "GBP", "pots": []}
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            transaction_tools.run_sync()
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        rows = reopened.execute("SELECT status FROM sync_log").fetchall()
+        assert [r[0] for r in rows] == ["ok"]
+
+
+class TestALaterPageFailingIsAlsoAFailure(unittest.TestCase):
+    """Page 0 is not the only page, and a hole in the history is not a success.
+
+    A later page failing used to break out of the loop recording nothing, so
+    the run was logged ok with whatever it had managed to fetch, and the
+    throttle then suppressed the next sync for the rest of the day over a
+    partial cache.
+    """
+
+    def test_a_failure_on_a_later_page_is_recorded(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        calls = {"n": 0}
+        full_page = [
+            _mk(f"tx_{i}", amount=-100, created=f"2026-03-{i % 28 + 1:02d}T10:00:00Z", settled="s")
+            for i in range(100)
+        ]
+
+        def fake_get(path):
+            if path == "/accounts":
+                return {"accounts": [{"id": "acc_1", "type": "uk_retail", "closed": False}]}
+            if path.startswith("/transactions"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return {"transactions": full_page}
+                raise MonzoAPIError("Monzo returned an unreadable response.")
+            return {"balance": 0, "currency": "GBP", "pots": []}
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            result = transaction_tools.run_sync()
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        statuses = [r[0] for r in reopened.execute("SELECT status FROM sync_log").fetchall()]
+
+        assert "transactions_error" in result["details"][0]
+        assert statuses == ["error"]
+
+
+class TestTheAutoSyncThrottleCountsAttempts(unittest.TestCase):
+    """The throttle has to count attempts, not successes.
+
+    Gating on the last successful sync means a sync that keeps failing never
+    advances the timestamp that gates it, so every tool call starts a fresh
+    full sync - answering a rate limit or a captive portal by retrying
+    continuously, and writing a sync_log row each time.
+    """
+
+    def _runs_after_a_failure_today(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+        db_conn.execute(
+            "INSERT INTO sync_log (synced_at, status, records_added, notes) VALUES (?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), "error", 0, ""),
+        )
+        db_conn.commit()
+
+        ran = {"n": 0}
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools, "run_sync", lambda *a, **k: ran.__setitem__("n", 1)),
+        ):
+            transaction_tools.auto_sync_if_stale()
+        return ran["n"]
+
+    def test_a_failure_today_still_throttles_the_rest_of_the_day(self):
+        assert self._runs_after_a_failure_today() == 0
+
+    def test_a_local_date_ahead_of_utc_does_not_defeat_the_throttle(self):
+        """log_sync stores UTC; comparing it to a local date reopens the storm.
+
+        East of Greenwich there is a window each night where the row just
+        written is dated behind the local today, so the gate never closes and
+        never self-corrects - one hour in BST, half a day at UTC+13.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+        # 23:30 UTC on the 9th: a sync that has only just finished.
+        db_conn.execute(
+            "INSERT INTO sync_log (synced_at, status, records_added, notes) VALUES (?, ?, ?, ?)",
+            (datetime(2026, 8, 9, 23, 30, tzinfo=timezone.utc).isoformat(), "ok", 0, ""),
+        )
+        db_conn.commit()
+
+        class _LocalIsAheadDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 8, 10)
+
+        class _FixedUTC(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                # A naive now() must differ, or the fixture cannot tell
+                # datetime.now(timezone.utc) from datetime.now() - and the
+                # latter is the shorter path back to exactly this bug.
+                if tz is None:
+                    return datetime(2026, 8, 10, 0, 35)
+                return datetime(2026, 8, 9, 23, 35, tzinfo=timezone.utc)
+
+        ran = {"n": 0}
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            # create=True so this still binds if the module stops importing
+            # date at all - which is the shape that passes.
+            patch.object(transaction_tools, "date", _LocalIsAheadDate, create=True),
+            patch.object(transaction_tools, "datetime", _FixedUTC),
+            patch.object(transaction_tools, "run_sync", lambda *a, **k: ran.__setitem__("n", 1)),
+        ):
+            transaction_tools.auto_sync_if_stale()
+
+        assert ran["n"] == 0
+
+    def test_a_local_evening_west_of_greenwich_counts_towards_the_next_utc_day(self):
+        """The other side of defining "today" as the UTC day.
+
+        West of Greenwich the local evening is already tomorrow in UTC, so a
+        sync there counts towards the next day and there can be one extra per
+        local day. Self-limiting: the row it writes carries the new UTC date,
+        and the equality case then throttles.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+        # 10:00 local on the 8th at UTC-7 is 17:00 UTC on the 8th.
+        db_conn.execute(
+            "INSERT INTO sync_log (synced_at, status, records_added, notes) VALUES (?, ?, ?, ?)",
+            (datetime(2026, 8, 8, 17, 0, tzinfo=timezone.utc).isoformat(), "ok", 0, ""),
+        )
+        db_conn.commit()
+
+        class _LocalIsBehindDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 8, 8)
+
+        class _FixedUTC(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                # 20:00 local on the 8th at UTC-7 is 03:00 UTC on the 9th.
+                if tz is None:
+                    return datetime(2026, 8, 8, 20, 0)
+                return datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc)
+
+        ran = {"n": 0}
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools, "date", _LocalIsBehindDate, create=True),
+            patch.object(transaction_tools, "datetime", _FixedUTC),
+            patch.object(transaction_tools, "run_sync", lambda *a, **k: ran.__setitem__("n", 1)),
+        ):
+            transaction_tools.auto_sync_if_stale()
+
+        assert ran["n"] == 1
+
+    def test_a_stale_cache_does_still_trigger_a_sync(self):
+        """The companion assertion.
+
+        Without it, the two negative tests above pass whether the throttle
+        works or auto_sync_if_stale raises into its own bare except.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        db_conn.execute(
+            "INSERT INTO sync_log (synced_at, status, records_added, notes) VALUES (?, ?, ?, ?)",
+            (yesterday.isoformat(), "ok", 0, ""),
+        )
+        db_conn.commit()
+
+        ran = {"n": 0}
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools, "run_sync", lambda *a, **k: ran.__setitem__("n", 1)),
+        ):
+            transaction_tools.auto_sync_if_stale()
+        assert ran["n"] == 1
+
+
+class TestNoExceptionTextReachesTheModel(unittest.TestCase):
+    """A bare except cannot know what its message set holds.
+
+    These details are returned to the model, so they carry the type only -
+    the same rule the trailing catch-all already follows.
+    """
+
+    def _details_when_balance_and_pots_fail(self, exc):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        def fake_get(path):
+            if path == "/accounts":
+                return {"accounts": [{"id": "acc_1", "type": "uk_retail", "closed": False}]}
+            if path.startswith("/balance") or path.startswith("/pots"):
+                raise exc
+            return {"transactions": []}
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            result = transaction_tools.run_sync()
+        return result["details"][0]
+
+    def test_neither_balance_nor_pots_repeats_the_message(self):
+        secret = "token file /home/alice/.config/monzo_tokens.json unreadable"
+        detail = self._details_when_balance_and_pots_fail(RuntimeError(secret))
+        assert detail["balance_error"] == "RuntimeError"
+        assert detail["pots_error"] == "RuntimeError"
+        assert "/home/alice" not in json.dumps(detail)
+
+
+class TestEveryExitFromRunSyncLeavesARow(unittest.TestCase):
+    """sync_log is the only record a run leaves.
+
+    The database is opened before the first API call because /accounts is
+    where a token failure surfaces, and the exit that fails there needs a
+    connection to write on.
+    """
+
+    def _statuses_after(self, fake_get):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        raised = None
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            try:
+                transaction_tools.run_sync()
+            except Exception as e:  # noqa: BLE001 - the test is what escapes
+                raised = e
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        rows = reopened.execute("SELECT status, notes FROM sync_log").fetchall()
+        return raised, rows
+
+    def test_a_failure_on_the_account_lookup_is_recorded(self):
+        def fake_get(path):
+            raise MonzoAuthError("Could not obtain an access token.")
+
+        raised, rows = self._statuses_after(fake_get)
+        assert isinstance(raised, MonzoAuthError)
+        assert rows and rows[0][0] == "error"
+        assert "MonzoAuthError" in rows[0][1]
+
+    def test_an_argument_rejected_before_any_call_writes_nothing(self):
+        """Deliberate, and the opposite of a hole.
+
+        A row here would advance the throttle, so a malformed argument would
+        suppress automatic syncing for the rest of the day having fetched
+        nothing. `since` is caller-supplied and reachable from the model.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        calls = []
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=lambda p: calls.append(p)),
+        ):
+            result = transaction_tools.run_sync(since="not-a-date")
+
+        rows = db_conn.execute("SELECT status FROM sync_log").fetchall()
+
+        assert "error" in result
+        assert calls == []
+        assert list(rows) == []
+
+    def test_finding_no_accounts_is_recorded(self):
+        def fake_get(path):
+            return {"accounts": []}
+
+        raised, rows = self._statuses_after(fake_get)
+        assert raised is None
+        assert rows and rows[0][0] == "error"
+
+    def test_a_database_that_cannot_record_it_does_not_replace_the_error(self):
+        """The row is best-effort; losing it must not hide the cause."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(
+                transaction_tools.api,
+                "get",
+                side_effect=MonzoAuthError("Could not obtain an access token."),
+            ),
+            patch.object(
+                transaction_tools,
+                "log_sync",
+                MagicMock(side_effect=sqlite3.OperationalError("readonly database")),
+            ),
+        ):
+            with self.assertRaises(MonzoAuthError):
+                transaction_tools.run_sync()
+
+
+class TestSCAIsNotAFailureOnAnyPage(unittest.TestCase):
+    """Only the user approving in the Monzo app changes an SCA outcome.
+
+    Logging it as a failure would have the throttle retry something no
+    retry can fix. The page-0 branch always did this; the later-page branch
+    did not exist until it was added, and briefly logged SCA as an error.
+    """
+
+    def _run_with_sca_on_page(self, page_index):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        calls = {"n": 0}
+        full_page = [
+            _mk(f"tx_{i}", amount=-100, created=f"2026-03-{i % 28 + 1:02d}T10:00:00Z", settled="s")
+            for i in range(100)
+        ]
+
+        def fake_get(path):
+            if path == "/accounts":
+                return {"accounts": [{"id": "acc_1", "type": "uk_retail", "closed": False}]}
+            if path.startswith("/transactions"):
+                calls["n"] += 1
+                if calls["n"] > page_index:
+                    raise MonzoSCAError("SCA required")
+                return {"transactions": full_page}
+            return {"balance": 0, "currency": "GBP", "pots": []}
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            result = transaction_tools.run_sync()
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        statuses = [r[0] for r in reopened.execute("SELECT status FROM sync_log").fetchall()]
+        return result["details"][0], statuses
+
+    def test_sca_on_a_later_page_is_a_note_not_an_error(self):
+        detail, statuses = self._run_with_sca_on_page(1)
+        assert "SCA" in detail["sca_note"]
+        assert "transactions_error" not in detail
+        assert statuses == ["ok"]
+
+
+class TestAnUnnamedFailureStillLeavesASyncLogRow(unittest.TestCase):
+    """MonzoAuthError is a sibling of the two types the loop names, not a parent.
+
+    It escaped run_sync leaving sync_log - the only record a run leaves -
+    empty, so nothing showed that syncing had stopped, and the throttle did
+    not count the attempt.
+    """
+
+    def _statuses_after(self, exc):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = pathlib.Path(tmp.name) / "monzo.db"
+        db_conn = sqlite3.connect(db_path)
+        self.addCleanup(db_conn.close)
+        db_conn.row_factory = sqlite3.Row
+        db_conn.executescript(SCHEMA)
+
+        def fake_get(path):
+            if path == "/accounts":
+                return {"accounts": [{"id": "acc_1", "type": "uk_retail", "closed": False}]}
+            raise exc
+
+        with (
+            patch.object(transaction_tools, "get_db", return_value=db_conn),
+            patch.object(transaction_tools.api, "get", side_effect=fake_get),
+        ):
+            with self.assertRaises(type(exc)):
+                transaction_tools.run_sync()
+
+        reopened = sqlite3.connect(db_path)
+        self.addCleanup(reopened.close)
+        rows = reopened.execute("SELECT status, notes FROM sync_log").fetchall()
+        return rows
+
+    def test_an_auth_failure_is_recorded_and_still_raised(self):
+        rows = self._statuses_after(MonzoAuthError("Could not obtain an access token."))
+        assert rows and rows[0][0] == "error"
+        assert "MonzoAuthError" in rows[0][1]
+
+    def test_the_recorded_note_carries_no_response_content(self):
+        rows = self._statuses_after(MonzoAuthError("/etc/secret/path"))
+        assert "/etc/secret/path" not in rows[0][1]
+
+
+if __name__ == "__main__":
+    unittest.main()

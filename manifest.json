@@ -1,0 +1,106 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "monzo-mcp",
+  "display_name": "Monzo",
+  "version": "0.11.0",
+  "description": "Ask Claude about your Monzo personal, joint or business account: balances, pots, transactions and spending. Read-only.",
+  "long_description": "Connects Claude to your Monzo account through Monzo's developer API, using an OAuth client you register yourself. Claude can show balances and pots, search transactions, and break down spending by category and merchant, for personal, joint and business accounts.\n\nThe extension is read-only: it cannot move money, change pots or edit transactions. It runs on your computer and talks directly to api.monzo.com. Your client secret is stored in your system's secure credential storage, and tokens and a transaction cache are kept in ~/.config/monzo-mcp on your computer.",
+  "author": {
+    "name": "Ilyes Benmansour",
+    "url": "https://github.com/ilyesBen"
+  },
+  "keywords": [
+    "monzo",
+    "bank",
+    "banking",
+    "finance",
+    "transactions",
+    "spending"
+  ],
+  "server": {
+    "type": "uv",
+    "entry_point": "src/monzo_mcp/cli.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--frozen",
+        "--directory",
+        "${__dirname}",
+        "monzo-mcp"
+      ],
+      "env": {
+        "MONZO_CLIENT_ID": "${user_config.client_id}",
+        "MONZO_CLIENT_SECRET": "${user_config.client_secret}",
+        "MONZO_MCP_CONFIG_DIR": "${HOME}/.config/monzo-mcp/config",
+        "MONZO_MCP_DB_PATH": "${HOME}/.config/monzo-mcp/monzo.db"
+      }
+    }
+  },
+  "user_config": {
+    "client_id": {
+      "type": "string",
+      "title": "Monzo Client ID",
+      "description": "From the OAuth client you created at developers.monzo.com. It starts with oauth2client_.",
+      "required": true
+    },
+    "client_secret": {
+      "type": "string",
+      "title": "Monzo Client secret",
+      "description": "From the same OAuth client. Treat it like a password.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "tools": [
+    {
+      "name": "monzo_login",
+      "description": "Sign in to Monzo in the browser. Changes nothing in your account."
+    },
+    {
+      "name": "monzo_list_accounts",
+      "description": "List accounts and whether each is personal, joint or business."
+    },
+    {
+      "name": "monzo_get_balance",
+      "description": "Current balance and spend today for one account."
+    },
+    {
+      "name": "monzo_list_pots",
+      "description": "Pots and their balances for one account."
+    },
+    {
+      "name": "monzo_sync",
+      "description": "Fetch new transactions into the local cache."
+    },
+    {
+      "name": "monzo_list_transactions",
+      "description": "List and filter cached transactions."
+    },
+    {
+      "name": "monzo_search_transactions",
+      "description": "Search transactions by merchant, payee, description or notes."
+    },
+    {
+      "name": "monzo_spending",
+      "description": "Spending by category and top merchants for a month."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.13"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ilyesBen/monzo-mcp"
+  },
+  "homepage": "https://github.com/ilyesBen/monzo-mcp",
+  "support": "https://github.com/ilyesBen/monzo-mcp/issues",
+  "license": "GPL-3.0-or-later"
+}
