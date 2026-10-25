@@ -3,9 +3,9 @@
   "manifest_version": "0.4",
   "name": "monzo-mcp",
   "display_name": "Monzo",
-  "version": "0.11.0",
-  "description": "Ask Claude about your Monzo personal, joint or business account: balances, pots, transactions and spending. Read-only.",
-  "long_description": "Connects Claude to your Monzo account through Monzo's developer API, using an OAuth client you register yourself. Claude can show balances and pots, search transactions, and break down spending by category and merchant, for personal, joint and business accounts.\n\nThe extension is read-only: it cannot move money, change pots or edit transactions. It runs on your computer and talks directly to api.monzo.com. Your client secret is stored in your system's secure credential storage, and tokens and a transaction cache are kept in ~/.config/monzo-mcp on your computer.",
+  "version": "0.11.1",
+  "description": "Ask Claude about your Monzo account: balance, pots, transactions and spending. Claude can only look; it can't move money or change anything.",
+  "long_description": "Works with personal, joint and business accounts.\n\nBEFORE YOU INSTALL (about 5 minutes, keep your phone nearby)\n\n1. On your computer, go to developers.monzo.com and sign in with your Monzo email address.\n2. Monzo emails you a link. Open it in the same browser.\n3. Open the Monzo app on your phone and approve the request to access your data. There may be no notification, so open the app anyway. Then refresh the website.\n4. Click Clients, then New OAuth Client. Fill in:\n   - Name: Claude\n   - Redirect URL: http://localhost:6600/callback\n   - Confidentiality: Confidential\n   Leave everything else as it is, then click Submit.\n5. Keep that page open. When you install, copy the Client ID and Client secret from it.\n\nAFTER YOU INSTALL\n\n6. Start a new chat and type: Log in to Monzo. Open the link Monzo emails you, as before.\n7. Approve the new request in the Monzo app.\n8. Straight away, type: Sync Monzo. (Within 5 minutes, Claude can fetch almost a year of history.)\n\nIf the website says \"insufficient_permissions\", you haven't approved in the app yet (step 3).\n\nYour sign-in and transaction history are stored only on your computer. Claude sees just what it looks up to answer you.\n\nStep-by-step guide: https://github.com/ilyesBen/monzo-mcp/blob/main/docs/claude-desktop.md",
   "author": {
     "name": "Ilyes Benmansour",
     "url": "https://github.com/ilyesBen"
@@ -42,13 +42,13 @@
     "client_id": {
       "type": "string",
       "title": "Monzo Client ID",
-      "description": "From the OAuth client you created at developers.monzo.com. It starts with oauth2client_.",
+      "description": "Copy it from developers.monzo.com (Clients > your client). It starts with oauth2client_",
       "required": true
     },
     "client_secret": {
       "type": "string",
       "title": "Monzo Client secret",
-      "description": "From the same OAuth client. Treat it like a password.",
+      "description": "On the same page as the Client ID. Keep it private, like a password.",
       "sensitive": true,
       "required": true
     }
@@ -101,6 +101,7 @@
     "url": "https://github.com/ilyesBen/monzo-mcp"
   },
   "homepage": "https://github.com/ilyesBen/monzo-mcp",
+  "documentation": "https://github.com/ilyesBen/monzo-mcp/blob/main/docs/claude-desktop.md",
   "support": "https://github.com/ilyesBen/monzo-mcp/issues",
   "license": "GPL-3.0-or-later"
 }

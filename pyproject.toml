@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "monzo-mcp"
-version = "0.11.0"
+version = "0.11.1"
 description = "Read-only MCP server for the Monzo banking API (personal, joint and business accounts) with OAuth, local transaction cache, and spending analysis."
 readme = "README.md"
 license = "GPL-3.0-or-later"

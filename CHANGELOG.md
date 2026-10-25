@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-10-25
+
+### Changed
+
+- The Claude Desktop extension's install screen now carries the setup steps in plain language: creating the Monzo client, approving access in the Monzo app, and signing in from Claude. The settings fields say where to find the Client ID and secret, and the extension links to the step-by-step guide.
+
 ## [0.11.0] - 2026-10-25
 
 First release of this fork of [partymola/monzo-mcp](https://github.com/partymola/monzo-mcp), taken at commit `76a42b2` (v0.10.0). Everything below 0.11.0 is upstream history.
