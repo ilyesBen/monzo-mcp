@@ -14,19 +14,45 @@ You don't need to install anything else.
 
 ## Step 1: Create your Monzo OAuth client
 
-Monzo only lets you connect your own account, through a "client" you create yourself.
+Monzo only lets you connect your own account, through a "client" you create yourself on Monzo's developer site. Do this on a computer, with your phone next to you.
 
-1. Go to [developers.monzo.com](https://developers.monzo.com) and sign in with your Monzo email address. Monzo emails you a link; open it.
-2. **Open the Monzo app and approve the request** to allow access to your data. It may not arrive as a notification, so open the app even if nothing pops up. Until you approve, everything on the developer site fails with `insufficient_permissions`.
-3. Go to **Clients → New OAuth Client** and fill in:
-   - **Name:** `Claude Desktop`
-   - **Logo URL:** leave blank
-   - **Redirect URLs:** `http://localhost:6600/callback` (exactly this)
-   - **Description:** anything
-   - **Confidentiality:** **Confidential**. Only confidential clients stay signed in; otherwise you'd have to sign in again every few hours.
-4. Click **Submit**. Keep the page open: you need the **Client ID** and **Client secret** in the next step.
+### 1a. Sign in to the developer site
+
+1. On your computer, go to [developers.monzo.com](https://developers.monzo.com) and click **Sign in with your Monzo account**.
+2. Enter the email address you use for Monzo. Monzo emails you a sign-in link.
+3. **Open the link in the same browser on your computer.** If it opens inside your email app, or on your phone, copy it and paste it into the browser tab where you started. Opening it anywhere else can fail with a "state mismatch" or authorisation error.
+
+You're now on the developer site, but **you can't do anything yet**. You still need to approve it in the app.
+
+### 1b. Approve data access in the Monzo app
+
+As soon as you sign in, Monzo sends a request to your phone asking you to allow access to your data.
+
+1. **Open the Monzo app on your phone.** The request often doesn't appear as a notification, so open the app even if nothing popped up. Look for the request on the home screen.
+2. Tap to **approve** access, then confirm with your PIN, Face ID or fingerprint.
+3. Go back to the developer site on your computer and **refresh the page**.
+
+> If anything on the developer site shows `forbidden.insufficient_permissions`, this approval hasn't happened yet. Open the app, approve, then refresh. You need to approve again each time you sign in to the developer site.
+
+### 1c. Create the client
+
+1. On the developer site, go to **Clients** and click **New OAuth Client**.
+2. Fill in the form:
+
+   | Field | What to enter |
+   |---|---|
+   | **Name** | `Claude Desktop` |
+   | **Logo URL** | Leave blank |
+   | **Redirect URLs** | `http://localhost:6600/callback`, exactly as written: no `s` in `http`, no trailing slash |
+   | **Description** | Anything, e.g. `Read-only access for Claude` |
+   | **Confidentiality** | **Confidential**. Only confidential clients stay signed in; otherwise you'd have to sign in again every few hours. |
+
+3. Click **Submit**.
+4. Open the new client and keep the page open. You need its **Client ID** (it starts with `oauth2client_`) and **Client secret** in Step 2.
 
 > 🔒 **Treat the client secret like a password.** Don't paste it into Slack, email or shared documents.
+
+> **You'll approve in the app twice in total:** once now, for the developer site, and once in Step 3, when Claude signs in. They're separate requests, and each one must be approved.
 
 ## Step 2: Install the extension
 
@@ -47,7 +73,7 @@ Have your phone ready: the last part is time-sensitive.
 1. Start a new chat and ask Claude: *"Log in to Monzo."*
 2. Claude asks permission to use the `monzo_login` tool. Click **Allow**. Your browser opens Monzo's sign-in page.
 3. Enter your email address and open the link Monzo emails you. If the link opens in your email app, copy it and paste it into the same browser instead.
-4. **Approve the access request in the Monzo app.**
+4. **Open the Monzo app and approve the new access request**, then confirm with your PIN or biometrics. This is a second request, separate from the one in Step 1b, and it may not arrive as a notification either.
 5. **Straight away**, tell Claude: *"Sync Monzo."* For 5 minutes after you approve, Monzo shares about 11 months of history. After that, only the last 90 days.
 
 ## Step 4: Check it works
@@ -72,7 +98,7 @@ You're done. 🎉
 |---|---|
 | Double-clicking the file does nothing | Install it from Claude's **Settings → Extensions → Advanced settings → Install Extension…** instead. |
 | **Monzo** isn't in the tools list | In **Settings → Extensions**, check the Monzo switch is on. Then quit Claude completely (⌘ Q on Mac, or **Quit** from the system tray on Windows) and reopen it. |
-| `insufficient_permissions` on developers.monzo.com | Approve the request in the Monzo app (Step 1.2), then refresh the page. |
+| `insufficient_permissions` on developers.monzo.com | Open the Monzo app, approve the access request (Step 1b), then refresh the page. |
 | Claude says Monzo isn't configured | Ask Claude to *"log in to Monzo"* (Step 3). |
 | Claude says the token is invalid or "SCA required" | Monzo asks you to sign in again every 90 days. Repeat Step 3. |
 | Only the last 90 days of history | You synced more than 5 minutes after approving. Repeat Step 3 and sync straight away. |

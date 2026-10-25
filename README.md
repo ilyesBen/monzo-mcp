@@ -42,11 +42,17 @@ A failed automatic sync is silent and counts as that day's attempt. If results l
 
 ## 1. Register a Monzo OAuth client
 
-1. Sign in at [developers.monzo.com](https://developers.monzo.com). **Approve the sign-in in the Monzo app** before doing anything else, or every action fails with `forbidden.insufficient_permissions`.
-2. Create a new OAuth client:
-   - **Redirect URL:** `http://localhost:6600/callback`
+Do this on a computer with your phone to hand. (Claude Desktop users: the [Desktop guide](docs/claude-desktop.md#step-1-create-your-monzo-oauth-client) has the same steps in more detail.)
+
+1. **Sign in to the developer site.** Go to [developers.monzo.com](https://developers.monzo.com) and enter your Monzo email address. Open the emailed link **in the same browser** you started in; if your mail app opens it elsewhere, copy and paste it instead.
+2. **Approve data access in the Monzo app.** Signing in sends an access request to the app. It often doesn't arrive as a notification, so open the app, approve the request and confirm with your PIN or biometrics. Then refresh the developer site. Until you approve, every action there fails with `forbidden.insufficient_permissions`, and you need to approve again each time you sign in.
+3. **Create the client.** Go to **Clients → New OAuth Client** and set:
+   - **Redirect URL:** `http://localhost:6600/callback`, exactly as written.
    - **Confidentiality:** **Confidential**. Only confidential clients get refresh tokens; without one you have to sign in again every few hours.
-3. Keep the **Client ID** and **Client Secret** to hand for the next step.
+   - Name, description: anything. Logo: blank.
+4. **Copy the Client ID** (starts with `oauth2client_`) **and Client secret** for the next step.
+
+Signing in with the server later (`monzo-mcp auth` or `monzo_login`) sends a **second, separate** request to the app, which must also be approved.
 
 ## 2. Install and authenticate
 
